@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,48 @@ def find_bag_dirs(raw_dir: Path) -> list[Path]:
     if not bag_dirs:
         raise RuntimeError(f"No bag directories found in {raw_dir}")
     return bag_dirs
+
+
+# Bag dirs are named "<sec>_<nsec><suffix>", e.g. "1773435474_413944359__cut_fill_OR_goal".
+_BAG_TIMESTAMP_RE = re.compile(r"^\d+_\d+(?P<suffix>.*)$")
+NO_SUFFIX_TOKEN = "none"
+
+
+def get_bag_suffix(bag_dir: Path) -> str | None:
+    """Return the suffix after the leading timestamp (leading underscores stripped).
+
+    Returns "" for a plain timestamp name, or None if the name has no timestamp prefix.
+    """
+    m = _BAG_TIMESTAMP_RE.match(bag_dir.name)
+    if m is None:
+        return None
+    return m.group("suffix").lstrip("_")
+
+
+def filter_bag_dirs_by_suffix(bag_dirs: list[Path], suffixes: list[str] | None) -> list[Path]:
+    """Keep only bags whose suffix exactly matches one of ``suffixes``.
+
+    Matching is exact (so "cut_fill_OR_goal" does not match "stable_cut_fill_OR_goal")
+    and ignores leading underscores. Use "none" to select bags with no suffix.
+    ``None``/empty/"all"/"any" disables filtering. Bags whose names lack a timestamp
+    prefix fall back to an endswith match.
+    """
+    if not suffixes:
+        return bag_dirs
+    wanted = {s.strip().lstrip("_") for s in suffixes if s.strip()}
+    if not wanted or wanted & {"all", "any", "*"}:
+        return bag_dirs
+    wanted = {"" if s == NO_SUFFIX_TOKEN else s for s in wanted}
+
+    kept = []
+    for d in bag_dirs:
+        suffix = get_bag_suffix(d)
+        if suffix is None:
+            if any(w and d.name.endswith(w) for w in wanted):
+                kept.append(d)
+        elif suffix in wanted:
+            kept.append(d)
+    return kept
 
 
 # ---------- Internal helpers ----------
@@ -373,6 +416,7 @@ def port_bags(
     num_shards: int | None = None,
     shard_index: int | None = None,
     vcodec: str = "libsvtav1",
+    suffixes: list[str] | None = None,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -387,14 +431,24 @@ def port_bags(
         shard_index: Index of this shard (0 to num_shards-1).
         vcodec: Video codec for encoding. Options: 'libsvtav1' (default, good compression),
             'libx264'/'h264' (fast), 'hevc', 'h264_nvenc' (GPU).
+        suffixes: Only include bags whose name suffix (after the timestamp) is in this
+            list. "none" selects unsuffixed bags. None/"all" includes every bag.
     """
     contract = load_contract(contract_path)
     specs = list(iter_specs(contract))
     features = _build_features(specs)
 
     all_bag_dirs = find_bag_dirs(raw_dir)
-    total_bags = len(all_bag_dirs)
-    logging.info("Found %d bags in %s", total_bags, raw_dir)
+    logging.info("Found %d bags in %s", len(all_bag_dirs), raw_dir)
+
+    filtered = filter_bag_dirs_by_suffix(all_bag_dirs, suffixes)
+    if len(filtered) != len(all_bag_dirs):
+        logging.info(
+            "Suffix filter %s: kept %d / %d bags", suffixes, len(filtered), len(all_bag_dirs)
+        )
+    if not filtered:
+        raise RuntimeError(f"No bags in {raw_dir} match suffixes {suffixes}")
+    all_bag_dirs = filtered
 
     # Select shard subset if sharding
     if num_shards is not None:
@@ -520,6 +574,12 @@ def main():
         choices=["libsvtav1", "libx264", "h264", "hevc", "h264_nvenc"],
         help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding."
     )
+    parser.add_argument(
+        "--suffixes", type=str, default="all",
+        help="Comma-separated bag-name suffixes to include (text after the '<sec>_<nsec>' "
+             "timestamp, exact match, leading underscores ignored), e.g. "
+             "'cut_fill_OR_goal,none'. 'none' = bags with no suffix. Default: all."
+    )
 
     args = parser.parse_args()
 
@@ -535,6 +595,7 @@ def main():
             num_shards=args.num_shards,
             shard_index=args.shard_index,
             vcodec=args.vcodec,
+            suffixes=[x for x in args.suffixes.split(",") if x.strip()],
         )
     except KeyboardInterrupt:
         logging.info("\nInterrupted by user")
