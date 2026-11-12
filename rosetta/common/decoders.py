@@ -657,6 +657,26 @@ def _dec_float64(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
     return np.array([msg.data], dtype=np.float64)
 
 
+# =============================================================================
+# MARTI Decoders
+# =============================================================================
+
+
+@register_decoder("marti_common_msgs/msg/Float64Stamped", dtype="float64")
+def _dec_marti_float64_stamped(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode marti_common_msgs/Float64Stamped to float64 scalar.
+
+    Has a header, so ``align.stamp: header`` works.
+    Selector names are optional; the only valid field name is ``value``.
+    """
+    for name in spec.names or ():
+        if name != "value":
+            raise ValueError(
+                f"Unknown Float64Stamped field '{name}'. Valid fields: value"
+            )
+    return np.array([float(msg.value)], dtype=np.float64)
+
+
 @register_decoder("std_msgs/msg/Int32", dtype="int32")
 def _dec_int32(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
     """Decode std_msgs/Int32 to int32 scalar."""

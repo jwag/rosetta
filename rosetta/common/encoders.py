@@ -233,6 +233,27 @@ def _enc_float64(
     return msg
     
     
+@register_encoder("marti_common_msgs/msg/Float64Stamped")
+def _enc_marti_float64_stamped(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to marti_common_msgs/Float64Stamped (scalar with header).
+
+    Selector names are optional; the only valid field name is ``value``.
+    """
+    for name in spec.names or ():
+        if name != "value":
+            raise ValueError(
+                f"Unknown Float64Stamped field '{name}'. Valid fields: value"
+            )
+    msg_cls = get_message("marti_common_msgs/msg/Float64Stamped")
+    msg = msg_cls()
+    _set_header_stamp(msg, stamp_ns)
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+    msg.value = float(arr[0])
+    return msg
+
+
 # =============================================================================
 # Array Encoders
 # =============================================================================
