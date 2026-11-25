@@ -36,11 +36,14 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import sys
 import threading
 import time
 
+import numpy as np
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -51,7 +54,10 @@ from rosidl_runtime_py.utilities import get_message
 from std_msgs.msg import Float64, Int8, Int32, String
 from std_srvs.srv import SetBool, Trigger
 
+from rosetta.common import encoders as _encoders  # noqa: F401 - registers encoders
 from rosetta.common.contract import load_contract
+from rosetta.common.contract_utils import iter_action_specs
+from rosetta.common.converters import encode_value
 from rosetta.common.ros2_utils import qos_profile_from_dict
 
 from rosetta_interfaces.action import ManageEpisode, RecordEpisode, RunPolicy
@@ -254,8 +260,21 @@ class RosettaHilManagerNode(LifecycleNode):
 
         # Active episode goal handles for child actions
         self._policy_goal_handle = None
+        self._policy_result_future = None
         self._reward_goal_handle = None
         self._recorder_goal_handle = None
+
+        # True from the moment the RunPolicy goal is accepted until its result
+        # arrives (succeeded, aborted, or canceled), or the episode tears down.
+        # Plain bool: single assignments are atomic, and this is deliberately
+        # not guarded by _mux_lock (callers may hold it while cancelling).
+        self._policy_running = False
+
+        # Fail-safe publishing (safety_behavior from the contract's actions).
+        # Active when no policy is running and the human is not intervening.
+        self._safety_specs: dict[str, object] = {}  # command topic -> ActionStreamSpec
+        self._last_command_msg: dict[str, object] = {}  # command topic -> last forwarded msg
+        self._safety_active = False
 
         # Callback groups
         self._action_cbg = ReentrantCallbackGroup()
@@ -336,6 +355,21 @@ class RosettaHilManagerNode(LifecycleNode):
             self._contract = load_contract(contract_path)
         except Exception as e:
             self.get_logger().error(f"Failed to load contract: {e}")
+            return TransitionCallbackReturn.FAILURE
+
+        try:
+            self._safety_specs = {
+                spec.topic: spec
+                for spec in iter_action_specs(self._contract)
+                if spec.safety_behavior != "none"
+            }
+            if self._safety_specs:
+                self.get_logger().info(
+                    "Fail-safe actions: "
+                    + ", ".join(f"{t}={s.safety_behavior}" for t, s in self._safety_specs.items())
+                )
+        except Exception as e:
+            self.get_logger().error(f"Failed to build safety action specs: {e}")
             return TransitionCallbackReturn.FAILURE
 
         enable_reward = self.get_parameter("enable_reward_classifier").value
@@ -580,6 +614,10 @@ class RosettaHilManagerNode(LifecycleNode):
 
     def _destroy_resources(self) -> None:
         """Destroy subscriptions, publishers, and action clients/server."""
+        self._safety_specs = {}
+        self._last_command_msg = {}
+        self._safety_active = False
+
         for sub in self._mux_subs:
             self.destroy_subscription(sub)
         self._mux_subs = []
@@ -727,19 +765,62 @@ class RosettaHilManagerNode(LifecycleNode):
         return blended
 
     def _on_command_timer(self) -> None:
-        """Periodic timer to publish commands (policy, blended, or full teleop) to real topics."""
+        """Periodic timer to publish commands (policy, blended, full teleop, or safety) to real topics."""
+        if not self._accepting_goals or self._contract is None:
+            return
+
         with self._mux_lock:
             source = self._control_source
             latest_teleop = self._latest_teleop_msg
             policy_msgs = dict(self._latest_policy_msg)
 
+        intervention_active = source in ("teleop", "blend")
+        fail_safe = (not self._policy_running) and (not intervention_active)
+        if fail_safe != self._safety_active:
+            self._safety_active = fail_safe
+            if fail_safe:
+                self.get_logger().info("Fail-safe: no policy running and no teleop; publishing safety action")
+            else:
+                self.get_logger().info("Fail-safe: released")
+
+        if fail_safe:
+            now = self.get_clock().now()
+            for topic, spec in self._safety_specs.items():
+                entry = self._command_publishers.get(topic)
+                if entry is None:
+                    continue
+                _, pub = entry
+                try:
+                    msg = None
+                    if spec.safety_behavior == "hold":
+                        last = self._last_command_msg.get(topic)
+                        if last is not None:
+                            msg = copy.deepcopy(last)
+                            if hasattr(msg, "header"):
+                                msg.header.stamp = now.to_msg()
+                    if msg is None:
+                        names = list(spec.full_names or spec.names)
+                        msg = encode_value(
+                            spec, np.zeros(len(names), dtype=np.float32), now.nanoseconds
+                        )
+                    pub.publish(msg)
+                except Exception as e:
+                    self.get_logger().warning(
+                        f"Failed to publish safety action on {topic}: {e}",
+                        throttle_duration_sec=5.0,
+                    )
+            return
+
         for original_topic, (_, pub) in self._command_publishers.items():
             if source == "policy":
                 if original_topic in policy_msgs and policy_msgs[original_topic] is not None:
-                    pub.publish(policy_msgs[original_topic])
+                    msg = policy_msgs[original_topic]
+                    pub.publish(msg)
+                    self._last_command_msg[original_topic] = msg
             elif source == "teleop":
                 if latest_teleop is not None:
                     pub.publish(latest_teleop)
+                    self._last_command_msg[original_topic] = latest_teleop
             elif source == "blend":
                 if latest_teleop is not None:
                     pol_msg = policy_msgs.get(original_topic)
@@ -748,6 +829,7 @@ class RosettaHilManagerNode(LifecycleNode):
                     else:
                         out_msg = latest_teleop
                     pub.publish(out_msg)
+                    self._last_command_msg[original_topic] = out_msg
 
     def _on_policy_output(self, msg, original_topic: str) -> None:
         """Store policy output and forward if in policy mode."""
@@ -1050,8 +1132,11 @@ class RosettaHilManagerNode(LifecycleNode):
             self._latest_policy_msg.clear()
             self._latest_teleop_msg = None
             self._reset_intervention_stats()
+        self._last_command_msg.clear()
         self._policy_first_output_event.clear()
         self._recording_start_time = None
+        self._policy_running = False
+        self._policy_result_future = None
 
         enable_reward = self.get_parameter("enable_reward_classifier").value
         cancelled = False
@@ -1075,6 +1160,9 @@ class RosettaHilManagerNode(LifecycleNode):
                 fields["message"] = "Failed to start robot policy"
                 return fields, cancelled
             self._policy_goal_handle = policy_gh
+            self._policy_running = True
+            self._policy_result_future = policy_gh.get_result_async()
+            self._policy_result_future.add_done_callback(self._on_policy_result)
 
             # Wait for the first policy output before starting the recorder.
             # Falls back to starting the recorder anyway after a timeout so a
@@ -1147,7 +1235,9 @@ class RosettaHilManagerNode(LifecycleNode):
             self._cancel_all_children()
 
         finally:
+            self._policy_running = False
             self._policy_goal_handle = None
+            self._policy_result_future = None
             self._reward_goal_handle = None
             self._recorder_goal_handle = None
             self._recorder_service_active = False
@@ -1349,6 +1439,28 @@ class RosettaHilManagerNode(LifecycleNode):
         self.get_logger().info("Reward classifier started")
         return goal_handle
 
+    def _on_policy_result(self, future) -> None:
+        """Clear _policy_running when the policy goal reaches a terminal state.
+
+        Fires for success, abort, and cancel, so it also catches the policy
+        finishing or failing on its own mid-episode.
+        """
+        self._policy_running = False
+        try:
+            status = future.result().status
+        except Exception as e:
+            self.get_logger().warning(f"Policy result unavailable: {e}")
+            return
+
+        if status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().info("Policy goal ended: canceled")
+        elif status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().warning("Policy goal ended on its own: succeeded")
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().error("Policy goal ended on its own: aborted")
+        else:
+            self.get_logger().warning(f"Policy goal ended with status {status}")
+
     def _cancel_recorder(self) -> None:
         """Cancel the active recorder goal or service recording without waiting for result."""
         if self._use_recorder_services:
@@ -1383,7 +1495,7 @@ class RosettaHilManagerNode(LifecycleNode):
                 return
             # Wait for the goal to actually finish executing so _active_goal
             # is cleared before we send a new goal on the next episode.
-            result_future = self._policy_goal_handle.get_result_async()
+            result_future = self._policy_result_future or self._policy_goal_handle.get_result_async()
             if not _wait_for_future(result_future, RESULT_TIMEOUT_SEC):
                 self.get_logger().warning("Policy result timed out after cancel")
             self.get_logger().info("Robot policy cancelled")
