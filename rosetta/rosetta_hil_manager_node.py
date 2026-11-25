@@ -771,15 +771,22 @@ class RosettaHilManagerNode(LifecycleNode):
 
         with self._mux_lock:
             source = self._control_source
+            intervention_mode = self._intervention_mode
             latest_teleop = self._latest_teleop_msg
             policy_msgs = dict(self._latest_policy_msg)
 
+        if self._intervention_mode_pub is not None:
+            mode_msg = String()
+            mode_msg.data = intervention_mode
+            self._intervention_mode_pub.publish(mode_msg)
+
         intervention_active = source in ("teleop", "blend")
-        fail_safe = (not self._policy_running) and (not intervention_active)
+        policy_allowed = self._policy_running and (intervention_mode != "teleop")
+        fail_safe = (not policy_allowed) and (not intervention_active)
         if fail_safe != self._safety_active:
             self._safety_active = fail_safe
             if fail_safe:
-                self.get_logger().info("Fail-safe: no policy running and no teleop; publishing safety action")
+                self.get_logger().info("Fail-safe: no active policy/teleop output; publishing safety action")
             else:
                 self.get_logger().info("Fail-safe: released")
 
